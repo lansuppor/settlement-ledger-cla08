@@ -15,6 +15,11 @@ def _build_where(filters: dict) -> tuple[str, list]:
     if "order_id" in filters:
         clauses.append("order_id=?")
         params.append(filters["order_id"])
+    if "has_reversal" in filters:
+        # 按冲正状态过滤：已冲正（reversal_biz_id 落库）/ 未冲正
+        clauses.append(
+            "reversal_biz_id IS NOT NULL" if filters["has_reversal"] else "reversal_biz_id IS NULL"
+        )
     for name, column in RANGE_FILTERS.items():
         if f"{name}_min_cents" in filters:
             clauses.append(f"{column}>=?")

@@ -2,7 +2,7 @@ import sqlite3
 
 from app.store.db import connect
 
-# 业务标识命名空间：冲正、作废、冲销、冲正修正、取消修正、退款单的业务标识在租户内共用唯一性，不得混用。
+# 业务标识命名空间：冲正、作废、冲销、冲正修正、取消修正、退款单及其执行冲正的业务标识在租户内共用唯一性，不得混用。
 # 各表承载业务标识的列名（退款单以退款单标识作为其单据业务标识）。
 BIZ_ID_TABLES = {
     "refunds": "biz_id",
@@ -11,6 +11,7 @@ BIZ_ID_TABLES = {
     "corrections": "biz_id",
     "correction_cancels": "biz_id",
     "refund_orders": "refund_id",
+    "refund_reversals": "biz_id",
 }
 
 def _rollback_safe(conn: sqlite3.Connection) -> None:

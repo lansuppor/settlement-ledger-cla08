@@ -68,6 +68,9 @@ class RefundSearchIn(BaseModel):
     filters: dict | None = None
     page: dict | None = None
 
+class RefundReverseIn(BaseModel):
+    biz_id: str = Field(min_length=1)  # 本次冲正的业务标识，租户内唯一
+
 @app.get("/health")
 def health() -> dict:
     conn = connect()
@@ -286,6 +289,12 @@ def execute_refund_order(
 @app.post("/refund-orders/{refund_id}/cancel")
 def cancel_refund_order(refund_id: str, x_tenant: str = Header(default="")) -> JSONResponse:
     return _refund_lifecycle_call(x_tenant, refund_id, refund_orders.cancel)
+
+@app.post("/refund-orders/{refund_id}/reversal")
+def reverse_refund_order(
+    refund_id: str, body: RefundReverseIn, x_tenant: str = Header(default="")
+) -> JSONResponse:
+    return _refund_lifecycle_call(x_tenant, refund_id, refund_orders.reverse, body.biz_id)
 
 @app.post("/refund-orders/search")
 def search_refund_orders(
