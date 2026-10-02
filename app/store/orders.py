@@ -2,8 +2,16 @@ import sqlite3
 
 from app.store.db import connect
 
-# 业务标识命名空间：冲正、作废、冲销、冲正修正、取消修正的业务标识在租户内共用唯一性，不得混用
-BIZ_ID_TABLES = ("refunds", "voids", "writeoffs", "corrections", "correction_cancels")
+# 业务标识命名空间：冲正、作废、冲销、冲正修正、取消修正、退款单的业务标识在租户内共用唯一性，不得混用。
+# 各表承载业务标识的列名（退款单以退款单标识作为其单据业务标识）。
+BIZ_ID_TABLES = {
+    "refunds": "biz_id",
+    "voids": "biz_id",
+    "writeoffs": "biz_id",
+    "corrections": "biz_id",
+    "correction_cancels": "biz_id",
+    "refund_orders": "refund_id",
+}
 
 def _rollback_safe(conn: sqlite3.Connection) -> None:
     try:
@@ -29,11 +37,11 @@ def _shape(row: sqlite3.Row) -> dict:
 
 def _assert_biz_id_free(conn: sqlite3.Connection, tenant: str, biz_id: str, own_table: str) -> None:
     """业务标识不得跨操作类型混用：已被其他操作类型占用即拒绝。"""
-    for table in BIZ_ID_TABLES:
+    for table, column in BIZ_ID_TABLES.items():
         if table == own_table:
             continue
         used = conn.execute(
-            f"SELECT 1 FROM {table} WHERE tenant=? AND biz_id=?",
+            f"SELECT 1 FROM {table} WHERE tenant=? AND {column}=?",
             (tenant, biz_id),
         ).fetchone()
         if used is not None:
@@ -138,6 +146,50 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
         conn.close()
     return get(tenant, order_id)
 
+def apply_refund_in_tx(
+    conn: sqlite3.Connection, tenant: str, order_id: str, biz_id: str,
+    amount_cents: int, refund_order_id: str | None = None,
+) -> None:
+    """在调用方已开启的事务内登记一笔冲正并追加流水。
+
+    供直接冲正与退款单执行到账共用，保证两者累计冲正、可退余额、终态口径一致。
+    订单不存在/跨租户抛 LookupError；终态、非正数、超过可退余额抛 ValueError，
+    由调用方整体回滚。biz_id 命名空间占用由调用方在前置校验保证。
+    """
+    row = conn.execute(
+        "SELECT amount_cents, paid_cents, refunded_cents, written_off_cents, status FROM orders WHERE tenant=? AND order_id=?",
+        (tenant, order_id),
+    ).fetchone()
+    if row is None:
+        raise LookupError("order not found")
+    _assert_not_terminal(row)
+    if amount_cents <= 0:
+        raise ValueError("refund amount must be positive")
+    refundable = row["paid_cents"] - row["refunded_cents"]
+    if amount_cents > refundable:
+        raise ValueError("refund exceeds refundable balance")
+
+    new_refunded = row["refunded_cents"] + amount_cents
+    # 可退余额减累计冲销归零且已收大于零：收付进入终态；其余情况保留原状态
+    new_status = (
+        "completed"
+        if _is_terminal(row["paid_cents"], new_refunded, row["written_off_cents"])
+        else row["status"]
+    )
+    conn.execute(
+        "UPDATE orders SET refunded_cents=?, status=? WHERE tenant=? AND order_id=?",
+        (new_refunded, new_status, tenant, order_id),
+    )
+    conn.execute(
+        "INSERT INTO refunds(tenant, biz_id, order_id, amount_cents, refund_order_id) VALUES(?,?,?,?,?)",
+        (tenant, biz_id, order_id, amount_cents, refund_order_id),
+    )
+    _insert_ledger(
+        conn, tenant, order_id, "refund", biz_id, amount_cents,
+        row["paid_cents"], row["amount_cents"] - row["paid_cents"],
+        new_refunded, row["written_off_cents"],
+    )
+
 def add_refund(
     tenant: str, order_id: str, biz_id: str, amount_cents: int
 ) -> tuple[dict, bool] | None:
@@ -152,10 +204,13 @@ def add_refund(
     try:
         conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
-            "SELECT tenant, biz_id, order_id, amount_cents, created_at FROM refunds WHERE tenant=? AND biz_id=?",
+            "SELECT tenant, biz_id, order_id, amount_cents, refund_order_id, created_at FROM refunds WHERE tenant=? AND biz_id=?",
             (tenant, biz_id),
         ).fetchone()
         if existing is not None:
+            # 退款单执行到账写入的冲正行属于退款单单据命名空间，直接冲正不得重放或复用
+            if existing["refund_order_id"] is not None:
+                raise ValueError("biz_id already used by another operation")
             # 重放：业务标识已存在，只返回同一记录
             if existing["order_id"] != order_id:
                 raise ValueError("biz_id already used for another order")
@@ -164,40 +219,7 @@ def add_refund(
             conn.execute("COMMIT")
             return _build_op_result(record, get(tenant, order_id), replayed), True
         _assert_biz_id_free(conn, tenant, biz_id, "refunds")
-
-        row = conn.execute(
-            "SELECT amount_cents, paid_cents, refunded_cents, written_off_cents, status FROM orders WHERE tenant=? AND order_id=?",
-            (tenant, order_id),
-        ).fetchone()
-        if row is None:
-            raise LookupError("order not found")
-        _assert_not_terminal(row)
-        if amount_cents <= 0:
-            raise ValueError("refund amount must be positive")
-        refundable = row["paid_cents"] - row["refunded_cents"]
-        if amount_cents > refundable:
-            raise ValueError("refund exceeds refundable balance")
-
-        new_refunded = row["refunded_cents"] + amount_cents
-        # 可退余额减累计冲销归零且已收大于零：收付进入终态；其余情况保留原状态
-        new_status = (
-            "completed"
-            if _is_terminal(row["paid_cents"], new_refunded, row["written_off_cents"])
-            else row["status"]
-        )
-        conn.execute(
-            "UPDATE orders SET refunded_cents=?, status=? WHERE tenant=? AND order_id=?",
-            (new_refunded, new_status, tenant, order_id),
-        )
-        conn.execute(
-            "INSERT INTO refunds(tenant, biz_id, order_id, amount_cents) VALUES(?,?,?,?)",
-            (tenant, biz_id, order_id, amount_cents),
-        )
-        _insert_ledger(
-            conn, tenant, order_id, "refund", biz_id, amount_cents,
-            row["paid_cents"], row["amount_cents"] - row["paid_cents"],
-            new_refunded, row["written_off_cents"],
-        )
+        apply_refund_in_tx(conn, tenant, order_id, biz_id, amount_cents)
         conn.execute("COMMIT")
         saved = conn.execute(
             "SELECT tenant, biz_id, order_id, amount_cents, created_at FROM refunds WHERE tenant=? AND biz_id=?",
