@@ -166,3 +166,162 @@ def test_state_and_replay_survive_restart() -> None:
     assert state["refunded_cents"] == 80 and state["refundable_cents"] == 120
     entries = client.get("/orders/p1/ledger", headers={"X-Tenant": "t1"}).json()["entries"]
     assert len(entries) == 3
+
+# ---------- 批量受理导入 ----------
+
+def test_batch_rows_apply_independently_with_distinct_reasons() -> None:
+    client.post("/orders", json={"tenant": "t1", "order_id": "b-exists", "amount_cents": 100, "currency": "CNY"})
+    rows = [
+        {"tenant": "t1", "order_id": "b1", "amount_cents": 500, "currency": "CNY"},      # 受理
+        {"tenant": "t1", "order_id": "b-exists", "amount_cents": 100, "currency": "CNY"}, # 重复受理
+        {"tenant": "t1", "order_id": "b2", "amount_cents": 0, "currency": "CNY"},         # 金额非法
+        {"tenant": "t1", "order_id": "b3", "amount_cents": 10.5, "currency": "CNY"},      # 金额非整数
+        {"tenant": "t1", "order_id": "b4", "amount_cents": 100, "currency": "GBP"},       # 币种不支持
+        {"tenant": "t1", "order_id": "", "amount_cents": 100, "currency": "CNY"},         # 标识为空
+        {"tenant": "t1", "amount_cents": 100, "currency": "CNY"},                          # 标识缺失
+        {"tenant": "t1", "order_id": "b1", "amount_cents": 500, "currency": "CNY"},       # 批内重复
+        {"tenant": "t2", "order_id": "b1", "amount_cents": 700, "currency": "USD"},       # 跨租户同标识，独立受理
+    ]
+    resp = client.post("/orders/batch", json={"rows": rows})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["accepted"] == 2 and data["rejected"] == 7
+    results = data["results"]
+    assert [r["line"] for r in results] == list(range(1, 10))
+    assert results[0]["status"] == "accepted"
+    assert results[0]["order"]["outstanding_cents"] == 500   # 成功行给出新订单结果金额
+    assert [r["reason"] for r in results[1:8]] == [
+        "duplicate_acceptance", "invalid_amount", "invalid_amount",
+        "unsupported_currency", "missing_field", "missing_field", "duplicate_in_batch",
+    ]
+    assert results[8]["status"] == "accepted" and results[8]["order"]["amount_cents"] == 700
+    # 拒绝行不产生流水
+    assert client.get("/orders/b-exists", headers={"X-Tenant": "t1"}).json()["amount_cents"] == 100
+    ledger = client.get("/orders/b-exists/ledger", headers={"X-Tenant": "t1"}).json()["entries"]
+    assert [e["op_type"] for e in ledger] == ["accept"]
+
+def test_batch_replay_does_not_reaccept_or_change_ledger() -> None:
+    rows = [
+        {"tenant": "t1", "order_id": "b10", "amount_cents": 300, "currency": "CNY"},
+        {"tenant": "t1", "order_id": "b11", "amount_cents": -1, "currency": "CNY"},
+    ]
+    first = client.post("/orders/batch", json={"rows": rows}).json()
+    assert first["accepted"] == 1 and first["rejected"] == 1
+    second = client.post("/orders/batch", json={"rows": rows}).json()
+    # 重放：已生效行不重复受理（按重复受理拒绝），被拒行仍被拒绝
+    assert second["accepted"] == 0 and second["rejected"] == 2
+    assert second["results"][0]["reason"] == "duplicate_acceptance"
+    assert second["results"][1]["reason"] == "invalid_amount"
+    state = client.get("/orders/b10", headers={"X-Tenant": "t1"}).json()
+    assert state["amount_cents"] == 300 and state["paid_cents"] == 0
+    ledger = client.get("/orders/b10/ledger", headers={"X-Tenant": "t1"}).json()["entries"]
+    assert [e["op_type"] for e in ledger] == ["accept"]   # 不新增流水
+
+def test_batch_rejected_row_does_not_rollback_others() -> None:
+    rows = [
+        {"tenant": "t1", "order_id": "b20", "amount_cents": 100, "currency": "CNY"},
+        {"tenant": "t1", "order_id": "b21", "amount_cents": 0, "currency": "CNY"},
+        {"tenant": "t1", "order_id": "b22", "amount_cents": 200, "currency": "EUR"},
+    ]
+    data = client.post("/orders/batch", json={"rows": rows}).json()
+    assert data["accepted"] == 2 and data["rejected"] == 1
+    assert client.get("/orders/b20", headers={"X-Tenant": "t1"}).status_code == 200
+    assert client.get("/orders/b21", headers={"X-Tenant": "t1"}).status_code == 404
+    assert client.get("/orders/b22", headers={"X-Tenant": "t1"}).status_code == 200
+
+# ---------- 条件检索 ----------
+
+def _seed_search_orders() -> None:
+    client.post("/orders", json={"tenant": "s1", "order_id": "so1", "amount_cents": 100, "currency": "CNY"})
+    client.post("/orders", json={"tenant": "s1", "order_id": "so2", "amount_cents": 200, "currency": "CNY"})
+    client.post("/orders", json={"tenant": "s1", "order_id": "so3", "amount_cents": 300, "currency": "USD"})
+    client.post("/orders/so2/payments", json={"amount_cents": 200}, headers={"X-Tenant": "s1"})
+    client.post("/orders/so3/payments", json={"amount_cents": 150}, headers={"X-Tenant": "s1"})
+    client.post("/orders/so3/refunds", json={"biz_id": "so3-r1", "amount_cents": 50}, headers={"X-Tenant": "s1"})
+    client.post("/orders", json={"tenant": "s2", "order_id": "so1", "amount_cents": 999, "currency": "CNY"})
+
+def test_search_filters_by_status_currency_ranges_and_refund_flag() -> None:
+    _seed_search_orders()
+    def search(filters: dict, request_id: str) -> list[dict]:
+        resp = client.post("/orders/search", json={"request_id": request_id, "filters": filters}, headers={"X-Tenant": "s1"})
+        assert resp.status_code == 200
+        return resp.json()["orders"]
+    # 状态
+    assert [o["order_id"] for o in search({"status": "settled"}, "q-status")] == ["so2"]
+    # 币种
+    assert [o["order_id"] for o in search({"currency": "USD"}, "q-currency")] == ["so3"]
+    # 订单金额区间
+    assert [o["order_id"] for o in search({"amount_min_cents": 150, "amount_max_cents": 300}, "q-amount")] == ["so2", "so3"]
+    # 已收金额区间
+    assert [o["order_id"] for o in search({"paid_min_cents": 100}, "q-paid")] == ["so2", "so3"]
+    # 累计冲正金额区间
+    assert [o["order_id"] for o in search({"refunded_min_cents": 1}, "q-refunded")] == ["so3"]
+    # 是否发生过冲正
+    assert [o["order_id"] for o in search({"has_refund": True}, "q-hasref")] == ["so3"]
+    assert [o["order_id"] for o in search({"has_refund": False}, "q-noref")] == ["so1", "so2"]
+    # 组合条件
+    combo = search({"currency": "CNY", "status": "accepted", "amount_max_cents": 150}, "q-combo")
+    assert [o["order_id"] for o in combo] == ["so1"]
+
+def test_search_pagination_is_stable_and_complete() -> None:
+    seen: list[str] = []
+    cursor = None
+    for page_no in range(3):
+        page = {"size": 2, **({"cursor": cursor} if cursor else {})}
+        resp = client.post(
+            "/orders/search",
+            json={"request_id": f"q-page-{page_no}", "filters": {"currency": "CNY"}, "page": page},
+            headers={"X-Tenant": "s1"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        seen += [o["order_id"] for o in data["orders"]]
+        cursor = data["page"]["next_cursor"]
+        if cursor is None:
+            break
+    assert seen == ["so1", "so2"]          # 不重不漏（s1 租户 CNY 订单仅两单）
+    assert cursor is None
+
+def test_search_replay_returns_same_snapshot_without_writes() -> None:
+    body = {"request_id": "q-replay", "filters": {"status": "accepted"}}
+    first = client.post("/orders/search", json=body, headers={"X-Tenant": "s1"})
+    assert first.status_code == 200 and first.headers["x-idempotent-replay"] == "0"
+    first_ids = [o["order_id"] for o in first.json()["orders"]]
+    # 首次检索后再受理新订单，重放仍返回首次的同一结果集
+    client.post("/orders", json={"tenant": "s1", "order_id": "so9", "amount_cents": 50, "currency": "CNY"})
+    replay = client.post("/orders/search", json=body, headers={"X-Tenant": "s1"})
+    assert replay.status_code == 200 and replay.headers["x-idempotent-replay"] == "1"
+    assert replay.json()["replayed"] is True
+    assert [o["order_id"] for o in replay.json()["orders"]] == first_ids
+    # 新去重标识的检索能看到新订单
+    fresh = client.post("/orders/search", json={"request_id": "q-replay-2", "filters": {"status": "accepted"}}, headers={"X-Tenant": "s1"})
+    assert "so9" in [o["order_id"] for o in fresh.json()["orders"]]
+
+def test_search_tenant_isolation_and_empty_result() -> None:
+    resp = client.post("/orders/search", json={"request_id": "q-iso"}, headers={"X-Tenant": "s2"})
+    assert resp.status_code == 200
+    assert [o["order_id"] for o in resp.json()["orders"]] == ["so1"]   # 仅本租户订单
+    assert all(o["tenant"] == "s2" for o in resp.json()["orders"])
+    # 未提供租户
+    assert client.post("/orders/search", json={"request_id": "q-no-tenant"}).status_code == 400
+    # 无命中返回空列表
+    empty = client.post("/orders/search", json={"request_id": "q-empty", "filters": {"status": "completed"}}, headers={"X-Tenant": "s2"})
+    assert empty.status_code == 200 and empty.json()["orders"] == []
+
+def test_search_invalid_params_have_distinct_reasons() -> None:
+    def reason(payload: dict) -> str:
+        resp = client.post("/orders/search", json=payload, headers={"X-Tenant": "s1"})
+        assert resp.status_code == 400
+        return resp.json()["detail"]
+    assert reason({"request_id": "bad1", "filters": {"status": "unknown"}}) == "invalid_status"
+    assert reason({"request_id": "bad2", "filters": {"currency": "GBP"}}) == "unsupported_currency"
+    assert reason({"request_id": "bad3", "filters": {"amount_min_cents": 10, "amount_max_cents": 5}}) == "invalid_amount_range"
+    assert reason({"request_id": "bad4", "filters": {"paid_min_cents": -1}}) == "invalid_paid_range"
+    assert reason({"request_id": "bad5", "filters": {"has_refund": "yes"}}) == "invalid_has_refund"
+    assert reason({"request_id": "bad6", "page": {"size": 0}}) == "invalid_page_size"
+    assert reason({"request_id": "bad7", "filters": {"mystery": 1}}).startswith("unknown_filter")
+    # 缺少去重标识
+    assert client.post("/orders/search", json={}, headers={"X-Tenant": "s1"}).status_code == 422
+    # 参数非法不写入：同一去重标识修正参数后按首次生效
+    ok = client.post("/orders/search", json={"request_id": "bad1"}, headers={"X-Tenant": "s1"})
+    assert ok.status_code == 200 and ok.json()["replayed"] is False

@@ -1,11 +1,12 @@
 import argparse
+from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import orders
+from app.store import imports, orders, search
 from app.store.db import connect, migrate
 
 app = FastAPI(title="settlement-ledger")
@@ -22,6 +23,14 @@ class PaymentIn(BaseModel):
 class RefundIn(BaseModel):
     biz_id: str = Field(min_length=1)
     amount_cents: int = Field(gt=0)
+
+class BatchIn(BaseModel):
+    rows: list[Any] = Field(min_length=1)
+
+class SearchIn(BaseModel):
+    request_id: str = Field(min_length=1)
+    filters: dict | None = None
+    page: dict | None = None
 
 @app.get("/health")
 def health() -> dict:
@@ -42,6 +51,28 @@ def create_order(body: OrderIn) -> dict:
             raise HTTPException(status_code=409, detail="order already accepted")
         raise
     return orders.get(body.tenant, body.order_id)
+
+@app.post("/orders/batch")
+def accept_batch(body: BatchIn) -> dict:
+    results = imports.accept_batch(body.rows)
+    accepted = sum(1 for item in results if item["status"] == "accepted")
+    return {"accepted": accepted, "rejected": len(results) - accepted, "results": results}
+
+@app.post("/orders/search")
+def search_orders(body: SearchIn, x_tenant: str = Header(default="")) -> JSONResponse:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        filters = order_rules.normalize_filters(body.filters)
+        size, cursor = order_rules.normalize_page(body.page)
+    except (ValueError, TypeError) as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    response, replayed = search.run_search(x_tenant, body.request_id, filters, size, cursor)
+    response["replayed"] = replayed
+    return JSONResponse(  # 重放返回首次的同一结果集，保持 200 与首调一致
+        response,
+        headers={"X-Idempotent-Replay": "1" if replayed else "0"},
+    )
 
 @app.get("/orders/{order_id}")
 def read_order(order_id: str, x_tenant: str = Header(default="", alias=None)) -> dict:
