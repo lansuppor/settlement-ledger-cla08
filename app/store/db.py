@@ -2,7 +2,7 @@ import sqlite3
 from pathlib import Path
 from app.config import db_path
 
-SCHEMA = Path(__file__).resolve().parents[2] / "migrations" / "001_init.sql"
+MIGRATIONS = Path(__file__).resolve().parents[2] / "migrations"
 
 def connect() -> sqlite3.Connection:
     path = db_path()
@@ -15,6 +15,12 @@ def connect() -> sqlite3.Connection:
 def migrate() -> None:
     conn = connect()
     try:
-        conn.executescript(SCHEMA.read_text(encoding="utf-8"))
+        conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations(name TEXT PRIMARY KEY)")
+        applied = {row["name"] for row in conn.execute("SELECT name FROM schema_migrations")}
+        for script in sorted(MIGRATIONS.glob("*.sql")):
+            if script.name in applied:
+                continue
+            conn.executescript(script.read_text(encoding="utf-8"))
+            conn.execute("INSERT INTO schema_migrations(name) VALUES(?)", (script.name,))
     finally:
         conn.close()

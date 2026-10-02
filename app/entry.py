@@ -17,6 +17,10 @@ class OrderIn(BaseModel):
 class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
 
+class RefundIn(BaseModel):
+    refund_id: str = Field(min_length=1)
+    amount_cents: int = Field(gt=0)
+
 @app.get("/health")
 def health() -> dict:
     conn = connect()
@@ -58,6 +62,29 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
+
+@app.post("/orders/{order_id}/refunds", status_code=201)
+def add_refund(order_id: str, body: RefundIn, response: Response, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        result = orders.add_refund(x_tenant, order_id, body.refund_id, body.amount_cents)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    if result is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    if result["replayed"]:
+        response.status_code = 200
+    return result
+
+@app.get("/orders/{order_id}/ledger")
+def read_ledger(order_id: str, x_tenant: str = Header(default="")) -> list[dict]:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    entries = orders.ledger(x_tenant, order_id)
+    if entries is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return entries
 
 def main() -> None:
     parser = argparse.ArgumentParser()
