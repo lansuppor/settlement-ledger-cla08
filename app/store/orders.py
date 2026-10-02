@@ -2,8 +2,9 @@ import sqlite3
 
 from app.store.db import connect
 
-# 业务标识命名空间：冲正、作废、冲销、冲正修正、取消修正、退款单的业务标识在租户内共用唯一性，不得混用。
-# 各表承载业务标识的列名（退款单以退款单标识作为其单据业务标识）。
+# 业务标识命名空间：冲正、作废、冲销、冲正修正、取消修正、退款单、退款单冲正的业务标识
+# 在租户内共用唯一性，不得混用。各表承载业务标识的列名（退款单以退款单标识作为其单据
+# 业务标识）。
 BIZ_ID_TABLES = {
     "refunds": "biz_id",
     "voids": "biz_id",
@@ -11,6 +12,7 @@ BIZ_ID_TABLES = {
     "corrections": "biz_id",
     "correction_cancels": "biz_id",
     "refund_orders": "refund_id",
+    "refund_reversals": "biz_id",
 }
 
 def _rollback_safe(conn: sqlite3.Connection) -> None:
@@ -189,6 +191,56 @@ def apply_refund_in_tx(
         row["paid_cents"], row["amount_cents"] - row["paid_cents"],
         new_refunded, row["written_off_cents"],
     )
+
+def apply_refund_reversal_in_tx(
+    conn: sqlite3.Connection, tenant: str, order_id: str, biz_id: str,
+    amount_cents: int,
+) -> dict:
+    """在调用方已开启的事务内执行退款单冲正的原订单重新入账并追加流水。
+
+    把该退款单已落库的实退金额从原订单累计冲正中扣减（累计冲正单调减少这次的量），
+    追加一条 refund_reversal 冲正流水（业务标识记本次冲正的业务标识，金额记实退金额），
+    按既有口径重判原订单状态；订单金额、已收、累计冲销及既有流水不改。
+
+    订单不存在/跨租户抛 LookupError；累计冲正不足扣减抛 ValueError，由调用方整体回滚。
+    biz_id 命名空间占用由调用方在前置校验保证。返回冲正后原订单结果字段（含结果金额
+    与重判状态），供调用方落首次结果快照与构造响应。
+    """
+    row = conn.execute(
+        "SELECT amount_cents, paid_cents, refunded_cents, written_off_cents, status FROM orders WHERE tenant=? AND order_id=?",
+        (tenant, order_id),
+    ).fetchone()
+    if row is None:
+        raise LookupError("order not found")
+    # 累计冲正单调减少这次的量：实退金额必须在既有累计冲正之内，不足则整单回滚。
+    # 冲正不改已收，paid - new_refunded 不会越过订单金额，无需终态前置拒绝——
+    # 冲正正是把已到账退款重新入账回原订单，终态订单冲正后按既有口径回到非终态。
+    if amount_cents <= 0 or amount_cents > row["refunded_cents"]:
+        raise ValueError("reversal amount exceeds accumulated refunds")
+
+    new_refunded = row["refunded_cents"] - amount_cents
+    # 作废与终态互斥、终态口径只与 已收−累计冲正−累计冲销 有关：冲正使累计冲正下降，
+    # 按既有口径重判即可（原订单不可能为 voided：退款单只能在非作废订单上执行到账）。
+    new_status = _rejudge_status(
+        row["status"], row["amount_cents"], row["paid_cents"], new_refunded, row["written_off_cents"]
+    )
+    conn.execute(
+        "UPDATE orders SET refunded_cents=?, status=? WHERE tenant=? AND order_id=?",
+        (new_refunded, new_status, tenant, order_id),
+    )
+    _insert_ledger(
+        conn, tenant, order_id, "refund_reversal", biz_id, amount_cents,
+        row["paid_cents"], row["amount_cents"] - row["paid_cents"],
+        new_refunded, row["written_off_cents"],
+    )
+    return {
+        "paid_cents": row["paid_cents"],
+        "outstanding_cents": row["amount_cents"] - row["paid_cents"],
+        "refunded_cents": new_refunded,
+        "written_off_cents": row["written_off_cents"],
+        "refundable_cents": row["paid_cents"] - new_refunded,
+        "status": new_status,
+    }
 
 def add_refund(
     tenant: str, order_id: str, biz_id: str, amount_cents: int

@@ -12,6 +12,9 @@ def _build_where(filters: dict) -> tuple[str, list]:
     if "status" in filters:
         clauses.append("status=?")
         params.append(filters["status"])
+    if "reversed" in filters:
+        # 按冲正状态过滤：reversal_biz_id 是否为空
+        clauses.append("reversal_biz_id IS NOT NULL" if filters["reversed"] else "reversal_biz_id IS NULL")
     if "order_id" in filters:
         clauses.append("order_id=?")
         params.append(filters["order_id"])

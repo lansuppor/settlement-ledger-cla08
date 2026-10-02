@@ -8,6 +8,7 @@ REFUND_ORDER_STATUSES = {
     "succeeded",  # 执行到账（终态）
     "failed",     # 执行失败，可再次执行、可撤销
     "cancelled",  # 已撤销（终态）
+    "reversed",   # 已冲正（终态）：已到账退款单执行冲正后进入
 }
 
 # 申请金额区间筛选字段：筛选参数名 -> 退款单列名
@@ -27,7 +28,7 @@ def normalize_filters(filters: object) -> dict:
         return {}
     if not isinstance(filters, dict):
         raise TypeError("invalid_filters")
-    known = {"status", "order_id"} | {
+    known = {"status", "order_id", "reversed"} | {
         f"{name}_{bound}_cents" for name in RANGE_FILTERS for bound in ("min", "max")
     }
     unknown = set(filters) - known
@@ -39,6 +40,12 @@ def normalize_filters(filters: object) -> dict:
         if not isinstance(status, str) or status not in REFUND_ORDER_STATUSES:
             raise ValueError("invalid_status")
         out["status"] = status
+    # 按冲正状态过滤：reversed=true 仅已冲正终态，false 为未冲正（reversal_biz_id 为空）
+    reversed_flag = filters.get("reversed")
+    if reversed_flag is not None:
+        if not isinstance(reversed_flag, bool):
+            raise ValueError("invalid_reversed")
+        out["reversed"] = reversed_flag
     order_id = filters.get("order_id")
     if order_id is not None:
         if not isinstance(order_id, str) or not order_id:
