@@ -1,10 +1,12 @@
 import argparse
-from fastapi import FastAPI, Header, HTTPException, Response
+
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from app.config import tenant_header
+
+from app.rules import order_rules
 from app.store import orders
 from app.store.db import connect, migrate
-from app.rules import order_rules
 
 app = FastAPI(title="settlement-ledger")
 
@@ -15,6 +17,10 @@ class OrderIn(BaseModel):
     currency: str = Field(min_length=3, max_length=3)
 
 class PaymentIn(BaseModel):
+    amount_cents: int = Field(gt=0)
+
+class RefundIn(BaseModel):
+    biz_id: str = Field(min_length=1)
     amount_cents: int = Field(gt=0)
 
 @app.get("/health")
@@ -52,12 +58,35 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
     if not x_tenant:
         raise HTTPException(status_code=400, detail="tenant header is required")
     try:
-        order = orders.add_payment(x_tenant, order_id, body.amount_cents)
+        return orders.add_payment(x_tenant, order_id, body.amount_cents)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="order not found")
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error))
-    if order is None:
+
+@app.post("/orders/{order_id}/refunds")
+def add_refund(order_id: str, body: RefundIn, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        refund, replayed = orders.add_refund(x_tenant, order_id, body.biz_id, body.amount_cents)
+    except LookupError:
         raise HTTPException(status_code=404, detail="order not found")
-    return order
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    return JSONResponse(  # 重放返回同一记录，保持 200 与首调一致
+        refund,
+        headers={"X-Idempotent-Replay": "1" if replayed else "0"},
+    )
+
+@app.get("/orders/{order_id}/ledger")
+def read_ledger(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    entries = orders.list_ledger(x_tenant, order_id)
+    if entries is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return {"order_id": order_id, "entries": entries}
 
 def main() -> None:
     parser = argparse.ArgumentParser()
