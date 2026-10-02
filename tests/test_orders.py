@@ -534,3 +534,322 @@ def test_void_and_writeoff_survive_restart() -> None:
     assert client.get("/orders/p3", headers={"X-Tenant": "t1"}).json()["status"] == "voided"
     assert len(client.get("/orders/p2/ledger", headers={"X-Tenant": "t1"}).json()["entries"]) == 3
     assert len(client.get("/orders/p3/ledger", headers={"X-Tenant": "t1"}).json()["entries"]) == 2
+
+# ---------- 收款冲正修正 ----------
+
+def test_payment_correction_reduces_paid_and_adds_ledger() -> None:
+    client.post("/orders", json={"tenant": "t1", "order_id": "pc1", "amount_cents": 500, "currency": "CNY"})
+    client.post("/orders/pc1/payments", json={"amount_cents": 300}, headers={"X-Tenant": "t1"})
+    resp = client.post("/orders/pc1/payment-corrections", json={"biz_id": "pc-1", "amount_cents": 100}, headers={"X-Tenant": "t1"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["biz_id"] == "pc-1" and data["amount_cents"] == 100
+    assert data["correction_biz_id"] is None and data["replayed"] is False
+    assert data["paid_cents"] == 200          # 已收减少
+    assert data["outstanding_cents"] == 300   # 未收增加
+    assert data["refunded_cents"] == 0        # 累计冲正不改
+    assert data["written_off_cents"] == 0
+    assert data["refundable_cents"] == 200    # 可退余额随已收下降
+    assert data["status"] == "accepted"       # 结清后修正回退为已受理
+    state = client.get("/orders/pc1", headers={"X-Tenant": "t1"}).json()
+    assert state["amount_cents"] == 500       # 订单金额不改
+    entries = client.get("/orders/pc1/ledger", headers={"X-Tenant": "t1"}).json()["entries"]
+    assert [e["op_type"] for e in entries] == ["accept", "payment", "correction"]
+    assert entries[2]["biz_id"] == "pc-1" and entries[2]["amount_cents"] == 100
+    assert entries[2]["paid_result_cents"] == 200 and entries[2]["outstanding_result_cents"] == 300
+
+def test_payment_correction_is_idempotent_by_biz_id() -> None:
+    client.post("/orders", json={"tenant": "t1", "order_id": "pc2", "amount_cents": 200, "currency": "CNY"})
+    client.post("/orders/pc2/payments", json={"amount_cents": 200}, headers={"X-Tenant": "t1"})
+    body = {"biz_id": "pc-dup", "amount_cents": 50}
+    first = client.post("/orders/pc2/payment-corrections", json=body, headers={"X-Tenant": "t1"})
+    second = client.post("/orders/pc2/payment-corrections", json=body, headers={"X-Tenant": "t1"})
+    assert first.status_code == 200 and second.status_code == 200
+    assert first.json()["created_at"] == second.json()["created_at"]
+    assert second.json()["replayed"] is True
+    assert second.headers["x-idempotent-replay"] == "1"
+    state = client.get("/orders/pc2", headers={"X-Tenant": "t1"}).json()
+    assert state["paid_cents"] == 150 and state["refundable_cents"] == 150  # 不重复扣减
+    entries = client.get("/orders/pc2/ledger", headers={"X-Tenant": "t1"}).json()["entries"]
+    assert [e["op_type"] for e in entries] == ["accept", "payment", "correction"]
+
+def test_payment_correction_distinct_biz_ids_apply_separately() -> None:
+    client.post("/orders", json={"tenant": "t1", "order_id": "pc3", "amount_cents": 200, "currency": "CNY"})
+    client.post("/orders/pc3/payments", json={"amount_cents": 200}, headers={"X-Tenant": "t1"})
+    client.post("/orders/pc3/payment-corrections", json={"biz_id": "pc-a", "amount_cents": 50}, headers={"X-Tenant": "t1"})
+    client.post("/orders/pc3/payment-corrections", json={"biz_id": "pc-b", "amount_cents": 50}, headers={"X-Tenant": "t1"})
+    state = client.get("/orders/pc3", headers={"X-Tenant": "t1"}).json()
+    assert state["paid_cents"] == 100 and state["outstanding_cents"] == 100
+
+def test_payment_correction_rejected_over_paid_balance() -> None:
+    client.post("/orders", json={"tenant": "t1", "order_id": "pc4", "amount_cents": 200, "currency": "CNY"})
+    client.post("/orders/pc4/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})
+    # 未收款不得修正
+    client.post("/orders", json={"tenant": "t1", "order_id": "pc4b", "amount_cents": 200, "currency": "CNY"})
+    assert client.post("/orders/pc4b/payment-corrections", json={"biz_id": "pc-n1", "amount_cents": 1}, headers={"X-Tenant": "t1"}).status_code == 409
+    # 超过已收
+    assert client.post("/orders/pc4/payment-corrections", json={"biz_id": "pc-n2", "amount_cents": 101}, headers={"X-Tenant": "t1"}).status_code == 409
+    # 非正数被模型拒绝
+    assert client.post("/orders/pc4/payment-corrections", json={"biz_id": "pc-n3", "amount_cents": 0}, headers={"X-Tenant": "t1"}).status_code == 422
+    state = client.get("/orders/pc4", headers={"X-Tenant": "t1"}).json()
+    assert state["paid_cents"] == 100 and state["outstanding_cents"] == 100
+    entries = client.get("/orders/pc4/ledger", headers={"X-Tenant": "t1"}).json()["entries"]
+    assert [e["op_type"] for e in entries] == ["accept", "payment"]
+
+def test_payment_correction_respects_refund_and_writeoff_caps() -> None:
+    # 已收 200、冲正 50、冲销 100：可修正上限 = 200-50-100 = 50
+    client.post("/orders", json={"tenant": "t1", "order_id": "pc5", "amount_cents": 200, "currency": "CNY"})
+    client.post("/orders/pc5/payments", json={"amount_cents": 200}, headers={"X-Tenant": "t1"})
+    client.post("/orders/pc5/refunds", json={"biz_id": "pc5-r", "amount_cents": 50}, headers={"X-Tenant": "t1"})
+    client.post("/orders/pc5/writeoffs", json={"biz_id": "pc5-w", "amount_cents": 100}, headers={"X-Tenant": "t1"})
+    assert client.post("/orders/pc5/payment-corrections", json={"biz_id": "pc5-c1", "amount_cents": 51}, headers={"X-Tenant": "t1"}).status_code == 409
+    assert client.post("/orders/pc5/payment-corrections", json={"biz_id": "pc5-c2", "amount_cents": 50}, headers={"X-Tenant": "t1"}).status_code == 200
+    state = client.get("/orders/pc5", headers={"X-Tenant": "t1"}).json()
+    assert state["paid_cents"] == 150 and state["refunded_cents"] == 50 and state["written_off_cents"] == 100
+    # 累计冲正、累计冲销不越上限：此后冲正/冲销均无空间
+    assert client.post("/orders/pc5/refunds", json={"biz_id": "pc5-r2", "amount_cents": 1}, headers={"X-Tenant": "t1"}).status_code == 409
+    assert client.post("/orders/pc5/writeoffs", json={"biz_id": "pc5-w2", "amount_cents": 1}, headers={"X-Tenant": "t1"}).status_code == 409
+
+def test_payment_correction_rejected_in_voided_and_completed() -> None:
+    client.post("/orders", json={"tenant": "t1", "order_id": "pc6v", "amount_cents": 100, "currency": "CNY"})
+    client.post("/orders/pc6v/void", json={"biz_id": "pc6-void"}, headers={"X-Tenant": "t1"})
+    assert client.post("/orders/pc6v/payment-corrections", json={"biz_id": "pc6-c", "amount_cents": 1}, headers={"X-Tenant": "t1"}).status_code == 409
+    # 收付完结终态：冲正将可退余额归零
+    client.post("/orders", json={"tenant": "t1", "order_id": "pc6t", "amount_cents": 100, "currency": "CNY"})
+    client.post("/orders/pc6t/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})
+    client.post("/orders/pc6t/refunds", json={"biz_id": "pc6-r", "amount_cents": 100}, headers={"X-Tenant": "t1"})
+    assert client.get("/orders/pc6t", headers={"X-Tenant": "t1"}).json()["status"] == "completed"
+    assert client.post("/orders/pc6t/payment-corrections", json={"biz_id": "pc6-ct", "amount_cents": 1}, headers={"X-Tenant": "t1"}).status_code == 409
+
+def test_payment_correction_biz_id_not_shared_with_other_ops() -> None:
+    client.post("/orders", json={"tenant": "t1", "order_id": "pc7a", "amount_cents": 100, "currency": "CNY"})
+    client.post("/orders", json={"tenant": "t1", "order_id": "pc7b", "amount_cents": 100, "currency": "CNY"})
+    client.post("/orders/pc7a/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})
+    client.post("/orders/pc7b/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})
+    client.post("/orders/pc7a/refunds", json={"biz_id": "pc7-shared", "amount_cents": 10}, headers={"X-Tenant": "t1"})
+    # 冲正业务标识不得复用为修正标识
+    assert client.post("/orders/pc7a/payment-corrections", json={"biz_id": "pc7-shared", "amount_cents": 10}, headers={"X-Tenant": "t1"}).status_code == 409
+    # 修正标识不得复用到另一订单
+    assert client.post("/orders/pc7a/payment-corrections", json={"biz_id": "pc7-x", "amount_cents": 10}, headers={"X-Tenant": "t1"}).status_code == 200
+    assert client.post("/orders/pc7b/payment-corrections", json={"biz_id": "pc7-x", "amount_cents": 10}, headers={"X-Tenant": "t1"}).status_code == 409
+    assert client.get("/orders/pc7b", headers={"X-Tenant": "t1"}).json()["paid_cents"] == 100
+    # 不同租户可复用
+    client.post("/orders", json={"tenant": "t2", "order_id": "pc7c", "amount_cents": 100, "currency": "CNY"})
+    client.post("/orders/pc7c/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t2"})
+    assert client.post("/orders/pc7c/payment-corrections", json={"biz_id": "pc7-x", "amount_cents": 10}, headers={"X-Tenant": "t2"}).status_code == 200
+
+def test_payment_correction_unknown_order_and_cross_tenant_are_404() -> None:
+    assert client.post("/orders/nope/payment-corrections", json={"biz_id": "pc-x", "amount_cents": 10}, headers={"X-Tenant": "t1"}).status_code == 404
+    client.post("/orders", json={"tenant": "t1", "order_id": "pc8", "amount_cents": 100, "currency": "CNY"})
+    client.post("/orders/pc8/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})
+    assert client.post("/orders/pc8/payment-corrections", json={"biz_id": "pc-8", "amount_cents": 10}, headers={"X-Tenant": "t2"}).status_code == 404
+    # 跨租户不产生流水
+    assert [e["op_type"] for e in client.get("/orders/pc8/ledger", headers={"X-Tenant": "t1"}).json()["entries"]] == ["accept", "payment"]
+
+# ---------- 取消收款冲正修正 ----------
+
+def test_cancel_payment_correction_restores_paid_and_adds_ledger() -> None:
+    client.post("/orders", json={"tenant": "t1", "order_id": "cc1", "amount_cents": 500, "currency": "CNY"})
+    client.post("/orders/cc1/payments", json={"amount_cents": 300}, headers={"X-Tenant": "t1"})
+    client.post("/orders/cc1/payment-corrections", json={"biz_id": "cc1-c", "amount_cents": 100}, headers={"X-Tenant": "t1"})
+    resp = client.post(
+        "/orders/cc1/payment-correction-cancels",
+        json={"biz_id": "cc1-x", "correction_biz_id": "cc1-c"},
+        headers={"X-Tenant": "t1"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["biz_id"] == "cc1-x" and data["correction_biz_id"] == "cc1-c"
+    assert data["amount_cents"] == 100 and data["replayed"] is False  # 金额取原始修正金额
+    assert data["paid_cents"] == 300          # 已收恢复
+    assert data["outstanding_cents"] == 200   # 未收减少
+    assert data["refunded_cents"] == 0 and data["written_off_cents"] == 0
+    assert data["refundable_cents"] == 300 and data["status"] == "accepted"
+    entries = client.get("/orders/cc1/ledger", headers={"X-Tenant": "t1"}).json()["entries"]
+    assert [e["op_type"] for e in entries] == ["accept", "payment", "correction", "correction_cancel"]
+    assert entries[3]["biz_id"] == "cc1-x" and entries[3]["amount_cents"] == 100
+    assert entries[3]["paid_result_cents"] == 300
+
+def test_cancel_payment_correction_restores_settled_status() -> None:
+    client.post("/orders", json={"tenant": "t1", "order_id": "cc2", "amount_cents": 100, "currency": "CNY"})
+    client.post("/orders/cc2/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})
+    client.post("/orders/cc2/payment-corrections", json={"biz_id": "cc2-c", "amount_cents": 40}, headers={"X-Tenant": "t1"})
+    assert client.get("/orders/cc2", headers={"X-Tenant": "t1"}).json()["status"] == "accepted"
+    resp = client.post(
+        "/orders/cc2/payment-correction-cancels",
+        json={"biz_id": "cc2-x", "correction_biz_id": "cc2-c"},
+        headers={"X-Tenant": "t1"},
+    )
+    assert resp.status_code == 200 and resp.json()["status"] == "settled"
+
+def test_cancel_payment_correction_is_idempotent_by_biz_id() -> None:
+    client.post("/orders", json={"tenant": "t1", "order_id": "cc3", "amount_cents": 200, "currency": "CNY"})
+    client.post("/orders/cc3/payments", json={"amount_cents": 200}, headers={"X-Tenant": "t1"})
+    client.post("/orders/cc3/payment-corrections", json={"biz_id": "cc3-c", "amount_cents": 50}, headers={"X-Tenant": "t1"})
+    body = {"biz_id": "cc3-x", "correction_biz_id": "cc3-c"}
+    first = client.post("/orders/cc3/payment-correction-cancels", json=body, headers={"X-Tenant": "t1"})
+    second = client.post("/orders/cc3/payment-correction-cancels", json=body, headers={"X-Tenant": "t1"})
+    assert first.status_code == 200 and second.status_code == 200
+    assert first.json()["created_at"] == second.json()["created_at"]
+    assert second.json()["replayed"] is True
+    assert second.headers["x-idempotent-replay"] == "1"
+    state = client.get("/orders/cc3", headers={"X-Tenant": "t1"}).json()
+    assert state["paid_cents"] == 200         # 不重复恢复
+    entries = client.get("/orders/cc3/ledger", headers={"X-Tenant": "t1"}).json()["entries"]
+    assert [e["op_type"] for e in entries] == ["accept", "payment", "correction", "correction_cancel"]
+
+def test_cancel_payment_correction_rejected_cases() -> None:
+    client.post("/orders", json={"tenant": "t1", "order_id": "cc4", "amount_cents": 200, "currency": "CNY"})
+    client.post("/orders/cc4/payments", json={"amount_cents": 200}, headers={"X-Tenant": "t1"})
+    client.post("/orders/cc4/payment-corrections", json={"biz_id": "cc4-c", "amount_cents": 50}, headers={"X-Tenant": "t1"})
+    # 被取消修正不存在
+    assert client.post(
+        "/orders/cc4/payment-correction-cancels",
+        json={"biz_id": "cc4-x0", "correction_biz_id": "missing"},
+        headers={"X-Tenant": "t1"},
+    ).status_code == 409
+    # 取消成功
+    assert client.post(
+        "/orders/cc4/payment-correction-cancels",
+        json={"biz_id": "cc4-x1", "correction_biz_id": "cc4-c"},
+        headers={"X-Tenant": "t1"},
+    ).status_code == 200
+    # 已被取消：再次取消拒绝
+    assert client.post(
+        "/orders/cc4/payment-correction-cancels",
+        json={"biz_id": "cc4-x2", "correction_biz_id": "cc4-c"},
+        headers={"X-Tenant": "t1"},
+    ).status_code == 409
+    state = client.get("/orders/cc4", headers={"X-Tenant": "t1"}).json()
+    assert state["paid_cents"] == 200         # 只恢复一次
+    # 订单不匹配：修正属于 cc4，拿去 cc5 取消
+    client.post("/orders", json={"tenant": "t1", "order_id": "cc5", "amount_cents": 200, "currency": "CNY"})
+    client.post("/orders/cc5/payments", json={"amount_cents": 200}, headers={"X-Tenant": "t1"})
+    assert client.post(
+        "/orders/cc5/payment-correction-cancels",
+        json={"biz_id": "cc4-x3", "correction_biz_id": "cc4-c"},
+        headers={"X-Tenant": "t1"},
+    ).status_code == 409
+    assert client.get("/orders/cc5", headers={"X-Tenant": "t1"}).json()["paid_cents"] == 200
+    # 终态订单拒绝取消（构造 completed 后重放取消标识之外的新取消）
+    client.post("/orders", json={"tenant": "t1", "order_id": "cc6", "amount_cents": 100, "currency": "CNY"})
+    client.post("/orders/cc6/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})
+    client.post("/orders/cc6/payment-corrections", json={"biz_id": "cc6-c", "amount_cents": 1}, headers={"X-Tenant": "t1"})
+    client.post("/orders/cc6/refunds", json={"biz_id": "cc6-r", "amount_cents": 99}, headers={"X-Tenant": "t1"})
+    assert client.get("/orders/cc6", headers={"X-Tenant": "t1"}).json()["status"] == "completed"
+    assert client.post(
+        "/orders/cc6/payment-correction-cancels",
+        json={"biz_id": "cc6-x", "correction_biz_id": "cc6-c"},
+        headers={"X-Tenant": "t1"},
+    ).status_code == 409
+
+def test_cancel_payment_correction_biz_id_namespace_and_404() -> None:
+    client.post("/orders", json={"tenant": "t1", "order_id": "cc7", "amount_cents": 100, "currency": "CNY"})
+    client.post("/orders/cc7/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})
+    client.post("/orders/cc7/payment-corrections", json={"biz_id": "cc7-c", "amount_cents": 30}, headers={"X-Tenant": "t1"})
+    # 取消标识与修正标识不得混用
+    dup = client.post(
+        "/orders/cc7/payment-correction-cancels",
+        json={"biz_id": "cc7-c", "correction_biz_id": "cc7-c"},
+        headers={"X-Tenant": "t1"},
+    )
+    assert dup.status_code == 409
+    # 取消标识重放跨订单拒绝
+    assert client.post(
+        "/orders/cc7/payment-correction-cancels",
+        json={"biz_id": "cc7-x", "correction_biz_id": "cc7-c"},
+        headers={"X-Tenant": "t1"},
+    ).status_code == 200
+    assert client.post(
+        "/orders/cc7/payment-correction-cancels",
+        json={"biz_id": "cc7-x", "correction_biz_id": "cc7-c"},
+        headers={"X-Tenant": "t1"},
+    ).status_code == 200  # 同订单重放仍 200
+    # 订单不存在 / 跨租户
+    assert client.post(
+        "/orders/nope/payment-correction-cancels",
+        json={"biz_id": "cc-x", "correction_biz_id": "whatever"},
+        headers={"X-Tenant": "t1"},
+    ).status_code == 404
+    assert client.post(
+        "/orders/cc7/payment-correction-cancels",
+        json={"biz_id": "cc-x2", "correction_biz_id": "cc7-c"},
+        headers={"X-Tenant": "t2"},
+    ).status_code == 404
+
+# ---------- 修正交错、并发与持久化 ----------
+
+def test_interleaved_correction_cancel_with_payment_stays_closed() -> None:
+    client.post("/orders", json={"tenant": "t1", "order_id": "ic1", "amount_cents": 100, "currency": "CNY"})
+    client.post("/orders/ic1/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})  # settled
+    # 修正 60：已收 40、未收 60
+    client.post("/orders/ic1/payment-corrections", json={"biz_id": "ic-c1", "amount_cents": 60}, headers={"X-Tenant": "t1"})
+    # 再收款不得超过未收：收 70 拒绝，收 60 生效回到结清
+    assert client.post("/orders/ic1/payments", json={"amount_cents": 70}, headers={"X-Tenant": "t1"}).status_code == 409
+    assert client.post("/orders/ic1/payments", json={"amount_cents": 60}, headers={"X-Tenant": "t1"}).status_code == 200
+    state = client.get("/orders/ic1", headers={"X-Tenant": "t1"}).json()
+    assert state["paid_cents"] == 100 and state["outstanding_cents"] == 0 and state["status"] == "settled"
+    # 取消修正恢复 60 会使已收 160 超过订单金额 100：拒绝
+    assert client.post(
+        "/orders/ic1/payment-correction-cancels",
+        json={"biz_id": "ic-x1", "correction_biz_id": "ic-c1"},
+        headers={"X-Tenant": "t1"},
+    ).status_code == 409
+    # 取消修正恢复 60 会使已收 160 超过订单金额 100：拒绝
+    assert client.post(
+        "/orders/ic1/payment-correction-cancels",
+        json={"biz_id": "ic-x1", "correction_biz_id": "ic-c1"},
+        headers={"X-Tenant": "t1"},
+    ).status_code == 409
+    # 只有再登记一笔修正把已收降下来，才有恢复空间：修正 60 后已收 40
+    client.post("/orders/ic1/payment-corrections", json={"biz_id": "ic-c2", "amount_cents": 60}, headers={"X-Tenant": "t1"})
+    assert client.get("/orders/ic1", headers={"X-Tenant": "t1"}).json()["paid_cents"] == 40
+    # 取消原修正：恢复后已收 100，不超订单金额，账面闭合回到结清
+    assert client.post(
+        "/orders/ic1/payment-correction-cancels",
+        json={"biz_id": "ic-x2", "correction_biz_id": "ic-c1"},
+        headers={"X-Tenant": "t1"},
+    ).status_code == 200
+    state = client.get("/orders/ic1", headers={"X-Tenant": "t1"}).json()
+    assert state["paid_cents"] == 100 and state["outstanding_cents"] == 0 and state["status"] == "settled"
+
+def test_concurrent_corrections_never_drive_paid_negative() -> None:
+    import threading
+    client.post("/orders", json={"tenant": "t1", "order_id": "ic2", "amount_cents": 100, "currency": "CNY"})
+    client.post("/orders/ic2/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})
+    results: list[int] = []
+    def correction(biz: str) -> None:
+        results.append(client.post("/orders/ic2/payment-corrections", json={"biz_id": biz, "amount_cents": 60}, headers={"X-Tenant": "t1"}).status_code)
+    t1 = threading.Thread(target=correction, args=("ic-a",))
+    t2 = threading.Thread(target=correction, args=("ic-b",))
+    t1.start(); t2.start(); t1.join(); t2.join()
+    assert sorted(results) == [200, 409]   # 串行化后只有一笔生效
+    state = client.get("/orders/ic2", headers={"X-Tenant": "t1"}).json()
+    assert state["paid_cents"] == 40 and state["outstanding_cents"] == 60
+
+def test_corrections_and_cancels_survive_restart() -> None:
+    client.post("/orders", json={"tenant": "t1", "order_id": "ic3", "amount_cents": 200, "currency": "CNY"})
+    client.post("/orders/ic3/payments", json={"amount_cents": 200}, headers={"X-Tenant": "t1"})
+    client.post("/orders/ic3/payment-corrections", json={"biz_id": "ic3-c1", "amount_cents": 80}, headers={"X-Tenant": "t1"})
+    client.post("/orders/ic3/payment-corrections", json={"biz_id": "ic3-c2", "amount_cents": 20}, headers={"X-Tenant": "t1"})
+    client.post(
+        "/orders/ic3/payment-correction-cancels",
+        json={"biz_id": "ic3-x1", "correction_biz_id": "ic3-c1"},
+        headers={"X-Tenant": "t1"},
+    )
+    # 模拟服务重启：重放修正与取消请求
+    replay_c = client.post("/orders/ic3/payment-corrections", json={"biz_id": "ic3-c2", "amount_cents": 20}, headers={"X-Tenant": "t1"})
+    assert replay_c.json()["replayed"] is True
+    replay_x = client.post(
+        "/orders/ic3/payment-correction-cancels",
+        json={"biz_id": "ic3-x1", "correction_biz_id": "ic3-c1"},
+        headers={"X-Tenant": "t1"},
+    )
+    assert replay_x.json()["replayed"] is True
+    state = client.get("/orders/ic3", headers={"X-Tenant": "t1"}).json()
+    # 已收 = 200-80-20+80(取消) = 180
+    assert state["paid_cents"] == 180 and state["outstanding_cents"] == 20
+    entries = client.get("/orders/ic3/ledger", headers={"X-Tenant": "t1"}).json()["entries"]
+    assert [e["op_type"] for e in entries] == [
+        "accept", "payment", "correction", "correction", "correction_cancel",
+    ]

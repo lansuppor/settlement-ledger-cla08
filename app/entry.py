@@ -31,6 +31,14 @@ class WriteoffIn(BaseModel):
     biz_id: str = Field(min_length=1)
     amount_cents: int = Field(gt=0)
 
+class PaymentCorrectionIn(BaseModel):
+    biz_id: str = Field(min_length=1)
+    amount_cents: int = Field(gt=0)
+
+class PaymentCorrectionCancelIn(BaseModel):
+    biz_id: str = Field(min_length=1)
+    correction_biz_id: str = Field(min_length=1)
+
 class BatchIn(BaseModel):
     rows: list[Any] = Field(min_length=1)
 
@@ -144,6 +152,38 @@ def add_writeoff(order_id: str, body: WriteoffIn, x_tenant: str = Header(default
         raise HTTPException(status_code=409, detail=str(error))
     return JSONResponse(  # 重放返回同一记录，保持 200 与首调一致
         writeoff,
+        headers={"X-Idempotent-Replay": "1" if replayed else "0"},
+    )
+
+@app.post("/orders/{order_id}/payment-corrections")
+def add_payment_correction(order_id: str, body: PaymentCorrectionIn, x_tenant: str = Header(default="")) -> JSONResponse:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        correction, replayed = orders.add_payment_correction(x_tenant, order_id, body.biz_id, body.amount_cents)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="order not found")
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    return JSONResponse(  # 重放返回同一记录，保持 200 与首调一致
+        correction,
+        headers={"X-Idempotent-Replay": "1" if replayed else "0"},
+    )
+
+@app.post("/orders/{order_id}/payment-correction-cancels")
+def cancel_payment_correction(order_id: str, body: PaymentCorrectionCancelIn, x_tenant: str = Header(default="")) -> JSONResponse:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        cancel, replayed = orders.cancel_payment_correction(
+            x_tenant, order_id, body.biz_id, body.correction_biz_id
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="order not found")
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    return JSONResponse(  # 重放返回同一记录，保持 200 与首调一致
+        cancel,
         headers={"X-Idempotent-Replay": "1" if replayed else "0"},
     )
 
