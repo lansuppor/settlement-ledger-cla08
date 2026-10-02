@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 from app.store.db import connect
@@ -203,3 +204,70 @@ def list_ledger(tenant: str, order_id: str) -> list[dict] | None:
     finally:
         conn.close()
     return [dict(row) for row in rows]
+
+def search(
+    tenant: str,
+    request_id: str,
+    filters: dict,
+    cursor: str | None,
+    limit: int,
+) -> tuple[dict, bool]:
+    """条件检索。返回 (结果, 是否重放)。
+
+    请求标识（租户内唯一）标识这次检索请求本身：首次检索按条件查出结果集，
+    连同分页位置一并快照落库；同一标识重放只返回首次的同一结果集，不再写入。
+    结果按订单标识升序稳定分页，无新订单时翻页不重不漏。
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT response FROM search_requests WHERE tenant=? AND request_id=?",
+            (tenant, request_id),
+        ).fetchone()
+        if existing is not None:
+            # 重放：只返回首次结果集快照，不产生任何写入
+            conn.execute("COMMIT")
+            return json.loads(existing["response"]), True
+
+        clauses = ["tenant=?"]
+        params: list = [tenant]
+        if filters.get("status") is not None:
+            clauses.append("status=?")
+            params.append(filters["status"])
+        if filters.get("currency") is not None:
+            clauses.append("currency=?")
+            params.append(filters["currency"])
+        for column, key in (("amount_cents", "amount"), ("paid_cents", "paid"), ("refunded_cents", "refunded")):
+            if filters.get(f"{key}_min") is not None:
+                clauses.append(f"{column}>=?")
+                params.append(filters[f"{key}_min"])
+            if filters.get(f"{key}_max") is not None:
+                clauses.append(f"{column}<=?")
+                params.append(filters[f"{key}_max"])
+        if filters.get("has_refund") is True:
+            clauses.append("refunded_cents>0")
+        elif filters.get("has_refund") is False:
+            clauses.append("refunded_cents=0")
+        if cursor:
+            clauses.append("order_id>?")
+            params.append(cursor)
+        sql = (
+            "SELECT tenant, order_id, amount_cents, paid_cents, refunded_cents, currency, status"
+            " FROM orders WHERE " + " AND ".join(clauses) + " ORDER BY order_id ASC LIMIT ?"
+        )
+        rows = conn.execute(sql, (*params, limit + 1)).fetchall()
+        items = [_shape(row) for row in rows[:limit]]
+        next_cursor = items[-1]["order_id"] if len(rows) > limit else None
+        response = {"request_id": request_id, "items": items, "next_cursor": next_cursor}
+        conn.execute(
+            "INSERT INTO search_requests(tenant, request_id, response) VALUES(?,?,?)",
+            (tenant, request_id, json.dumps(response)),
+        )
+        conn.execute("COMMIT")
+        return response, False
+    except Exception:
+        _rollback_safe(conn)
+        raise
+    finally:
+        conn.close()
