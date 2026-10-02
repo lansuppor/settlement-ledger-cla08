@@ -38,7 +38,7 @@ def _execute(
         params.append(cursor)
     # 按订单标识升序翻页：收付变动不改变排序键，无新受理时翻页不重不漏
     rows = conn.execute(
-        f"SELECT tenant, order_id, amount_cents, paid_cents, refunded_cents, currency, status"
+        f"SELECT tenant, order_id, amount_cents, paid_cents, refunded_cents, written_off_cents, currency, status"
         f" FROM orders WHERE {where} ORDER BY order_id ASC LIMIT ?",
         [tenant, *params, size],
     ).fetchall()

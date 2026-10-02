@@ -1,6 +1,6 @@
 ALLOWED_CURRENCIES = {"CNY", "USD", "EUR", "JPY"}
 
-ORDER_STATUSES = {"accepted", "settled", "completed"}
+ORDER_STATUSES = {"accepted", "settled", "completed", "voided"}
 
 # 金额区间筛选字段：筛选参数名 -> 订单列名
 RANGE_FILTERS = {
