@@ -2,7 +2,8 @@ import sqlite3
 
 from app.store.db import connect
 
-# 业务标识命名空间：冲正、作废、冲销、冲正修正、取消修正的业务标识在租户内共用唯一性，不得混用
+# 业务标识命名空间：冲正、作废、冲销、冲正修正、取消修正的业务标识与退款单标识
+# 在租户内共用唯一性，不得混用
 BIZ_ID_TABLES = ("refunds", "voids", "writeoffs", "corrections", "correction_cancels")
 
 def _rollback_safe(conn: sqlite3.Connection) -> None:
@@ -28,7 +29,7 @@ def _shape(row: sqlite3.Row) -> dict:
     }
 
 def _assert_biz_id_free(conn: sqlite3.Connection, tenant: str, biz_id: str, own_table: str) -> None:
-    """业务标识不得跨操作类型混用：已被其他操作类型占用即拒绝。"""
+    """业务标识不得跨操作类型混用：已被其他操作类型或退款单占用即拒绝。"""
     for table in BIZ_ID_TABLES:
         if table == own_table:
             continue
@@ -38,6 +39,13 @@ def _assert_biz_id_free(conn: sqlite3.Connection, tenant: str, biz_id: str, own_
         ).fetchone()
         if used is not None:
             raise ValueError("biz_id already used by another operation")
+    # 退款单标识列名为 refund_id，独立查询；任一订单侧操作表都不拥有它，恒需检查
+    used = conn.execute(
+        "SELECT 1 FROM refund_orders WHERE tenant=? AND refund_id=?",
+        (tenant, biz_id),
+    ).fetchone()
+    if used is not None:
+        raise ValueError("biz_id already used by a refund order")
 
 def _assert_not_terminal(row: sqlite3.Row) -> None:
     """终态（completed/voided）不可逆：此后收款、冲正、冲销、作废一律拒绝。"""

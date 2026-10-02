@@ -5,8 +5,8 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from app.rules import order_rules
-from app.store import imports, orders, search
+from app.rules import order_rules, refund_rules
+from app.store import imports, orders, refund_orders, refund_search, search
 from app.store.db import connect, migrate
 
 app = FastAPI(title="settlement-ledger")
@@ -43,6 +43,25 @@ class BatchIn(BaseModel):
     rows: list[Any] = Field(min_length=1)
 
 class SearchIn(BaseModel):
+    request_id: str = Field(min_length=1)
+    filters: dict | None = None
+    page: dict | None = None
+
+class RefundOrderIn(BaseModel):
+    # 与受理订单（POST /orders）一致：受理时租户在请求体给出
+    tenant: str = Field(min_length=1)
+    refund_id: str = Field(min_length=1)
+    order_id: str = Field(min_length=1)
+    request_cents: int = Field(gt=0)
+
+class RefundReviewIn(BaseModel):
+    approved: bool
+
+class RefundExecuteIn(BaseModel):
+    # 缺省或 null 表示上报执行成功；非空字符串表示上报执行失败并记录原因
+    failure_reason: str | None = Field(default=None, min_length=1)
+
+class RefundSearchIn(BaseModel):
     request_id: str = Field(min_length=1)
     filters: dict | None = None
     page: dict | None = None
@@ -195,6 +214,89 @@ def read_ledger(order_id: str, x_tenant: str = Header(default="")) -> dict:
     if entries is None:
         raise HTTPException(status_code=404, detail="order not found")
     return {"order_id": order_id, "entries": entries}
+
+# ---------- 退款单（refund order） ----------
+
+@app.post("/refund-orders", status_code=201)
+def accept_refund_order(body: RefundOrderIn) -> JSONResponse:
+    try:
+        refund, replayed = refund_orders.accept(
+            body.tenant, body.refund_id, body.order_id, body.request_cents
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="order not found")
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    # 重放返回首次的同一单据，保持 200 与项目既有重放约定一致
+    return JSONResponse(
+        refund,
+        status_code=200 if replayed else 201,
+        headers={"X-Idempotent-Replay": "1" if replayed else "0"},
+    )
+
+@app.get("/refund-orders/{refund_id}")
+def read_refund_order(refund_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    refund = refund_orders.get(None, x_tenant, refund_id)
+    if refund is None:
+        raise HTTPException(status_code=404, detail="refund order not found")
+    return refund
+
+@app.post("/refund-orders/{refund_id}/review")
+def review_refund_order(refund_id: str, body: RefundReviewIn, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        return refund_orders.review(x_tenant, refund_id, body.approved)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="refund order not found")
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+
+@app.post("/refund-orders/{refund_id}/execute")
+def execute_refund_order(refund_id: str, body: RefundExecuteIn, x_tenant: str = Header(default="")) -> JSONResponse:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        refund, replayed = refund_orders.execute(x_tenant, refund_id, body.failure_reason)
+    except LookupError as error:
+        # 退款单不存在与原订单已作废/终态/删除/跨租户均按 404，原因可区分
+        raise HTTPException(status_code=404, detail=str(error))
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    # 重放（已到账后重复执行）返回同一结果，保持 200 与首调一致
+    return JSONResponse(
+        refund,
+        headers={"X-Idempotent-Replay": "1" if replayed else "0"},
+    )
+
+@app.post("/refund-orders/{refund_id}/cancel")
+def cancel_refund_order(refund_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        return refund_orders.cancel(x_tenant, refund_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="refund order not found")
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+
+@app.post("/refund-orders/search")
+def search_refund_orders(body: RefundSearchIn, x_tenant: str = Header(default="")) -> JSONResponse:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        filters = refund_rules.normalize_filters(body.filters)
+        size, cursor = refund_rules.normalize_page(body.page)
+    except (ValueError, TypeError) as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    response, replayed = refund_search.run_search(x_tenant, body.request_id, filters, size, cursor)
+    response["replayed"] = replayed
+    return JSONResponse(  # 重放返回首次的同一结果集，保持 200 与首调一致
+        response,
+        headers={"X-Idempotent-Replay": "1" if replayed else "0"},
+    )
 
 def main() -> None:
     parser = argparse.ArgumentParser()
