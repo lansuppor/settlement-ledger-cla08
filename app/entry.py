@@ -24,6 +24,13 @@ class RefundIn(BaseModel):
     biz_id: str = Field(min_length=1)
     amount_cents: int = Field(gt=0)
 
+class VoidIn(BaseModel):
+    biz_id: str = Field(min_length=1)
+
+class WriteoffIn(BaseModel):
+    biz_id: str = Field(min_length=1)
+    amount_cents: int = Field(gt=0)
+
 class BatchIn(BaseModel):
     rows: list[Any] = Field(min_length=1)
 
@@ -107,6 +114,36 @@ def add_refund(order_id: str, body: RefundIn, x_tenant: str = Header(default="")
         raise HTTPException(status_code=409, detail=str(error))
     return JSONResponse(  # 重放返回同一记录，保持 200 与首调一致
         refund,
+        headers={"X-Idempotent-Replay": "1" if replayed else "0"},
+    )
+
+@app.post("/orders/{order_id}/void")
+def void_order(order_id: str, body: VoidIn, x_tenant: str = Header(default="")) -> JSONResponse:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        void, replayed = orders.void_order(x_tenant, order_id, body.biz_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="order not found")
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    return JSONResponse(  # 重放返回同一记录，保持 200 与首调一致
+        void,
+        headers={"X-Idempotent-Replay": "1" if replayed else "0"},
+    )
+
+@app.post("/orders/{order_id}/writeoffs")
+def add_writeoff(order_id: str, body: WriteoffIn, x_tenant: str = Header(default="")) -> JSONResponse:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        writeoff, replayed = orders.add_writeoff(x_tenant, order_id, body.biz_id, body.amount_cents)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="order not found")
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    return JSONResponse(  # 重放返回同一记录，保持 200 与首调一致
+        writeoff,
         headers={"X-Idempotent-Replay": "1" if replayed else "0"},
     )
 
