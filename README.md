@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、批量受理导入、按标识读取订单、条件检索订单、登记收款、登记收款冲正（退款）、订单作废、收款冲销与按订单追溯收付流水，并核对未收、累计冲正、累计冲销与可退余额；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、批量受理导入、按标识读取订单、条件检索订单、登记收款、登记收款冲正（退款）、订单作废、收款冲销、收款冲正修正与取消冲正修正，并按订单追溯收付流水，核对未收、累计冲正、累计冲销与可退余额；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -27,7 +27,9 @@
 - `POST /orders/{order_id}/refunds`：登记收款冲正（退款）。请求字段 `biz_id`（本次冲正的业务标识，租户内唯一）、`amount_cents`；成功返回 200 与冲正记录（含 `biz_id`、`amount_cents`、`replayed` 及订单的 `paid_cents`、`outstanding_cents`、`refunded_cents`、`written_off_cents`、`refundable_cents`）。同一 `biz_id` 重放返回同一记录（响应头 `X-Idempotent-Replay: 1`），不重复累计、不新增流水；超过可退余额或非正数返回 409/422；订单不存在或跨租户返回 404。
 - `POST /orders/{order_id}/void`：作废订单。请求字段 `biz_id`（本次作废的业务标识，租户内唯一，与订单标识、冲正/冲销业务标识独立，不得混用）。仅未发生收款的订单可作废，已收大于零返回 409；生效后进入 `voided` 终态，此后收款、冲正、冲销、再作废一律返回 409 且无任何变更；不改订单金额与既有流水，仅追加一条 `void` 流水。同一 `biz_id` 重放返回首次的同一记录（响应头 `X-Idempotent-Replay: 1`），不重复写流水、不改状态；同租户将该标识用于另一订单的作废或用于冲销返回 409 且状态不变；不同标识各自生效。订单不存在或跨租户返回 404，不泄漏是否存在，也不产生流水。
 - `POST /orders/{order_id}/writeoffs`：登记收款冲销。请求字段 `biz_id`（本次冲销的业务标识，租户内唯一）、`amount_cents`（正整数，不得超过 已收 − 累计冲正 − 累计冲销，超出或非正数返回 409/422 且无任何变更）。冲销不改已收与累计冲正，累计冲销单调增加；未收与可退余额不受冲销影响。同一 `biz_id` 重放返回首次的同一记录（响应头 `X-Idempotent-Replay: 1`），不重复累计、不新增流水；不同标识各自生效；订单不存在或跨租户返回 404。
-- `GET /orders/{order_id}/ledger`：按订单查询收付流水，按编号升序返回 `entries`，每条含 `seq`、`op_type`（accept/payment/refund/void/writeoff）、`biz_id`、`amount_cents` 与结果金额 `paid_result_cents`、`outstanding_result_cents`、`refunded_result_cents`、`written_off_result_cents`；订单不存在或跨租户返回 404。
+- `POST /orders/{order_id}/corrections`：登记收款冲正修正。请求字段 `biz_id`（本次修正的业务标识，租户内唯一，标识修正操作本身，与订单标识及冲正、作废、冲销、取消修正的业务标识独立，不得混用）、`amount_cents`（正整数，不得超过 已收 − 累计冲正 − 累计冲销；超过、非正数或金额非法返回 409/422 且无任何变更）。生效后已收减少、未收增加，订单金额与累计冲正、累计冲销及既有流水不改，追加一条 `correction` 修正流水；状态按既有口径重判（已收跌破订单金额回到 `accepted`，达到终态口径则进 `completed`）。同一 `biz_id` 重放返回首次的同一记录（含 `cancelled` 标记，响应头 `X-Idempotent-Replay: 1`），不重复扣减、不新增流水；不同标识各自生效；订单不存在或跨租户返回 404。
+- `POST /orders/{order_id}/correction-cancels`：取消一笔收款冲正修正。请求字段 `biz_id`（本次取消的业务标识，租户内唯一，与被取消修正的业务标识相互独立）、`correction_biz_id`（被取消修正的业务标识；取消金额取该修正的原始金额，不可指定）。仅已生效且未被取消的修正可取消；生效后已收恢复、未收减少，订单金额与既有流水不改，追加一条 `correction_cancel` 取消流水。被取消修正不存在（`correction not found`）、已被取消（`correction already cancelled`）、订单不匹配（`correction belongs to another order`）或恢复后已收会超过订单金额（`correction cancel would exceed order amount`）时返回 409 且无任何变更；已作废或终态订单一律拒绝。同一 `biz_id` 重放返回首次的同一记录（响应头 `X-Idempotent-Replay: 1`），不重复恢复、不新增流水；不同标识各自生效；订单不存在或跨租户返回 404。
+- `GET /orders/{order_id}/ledger`：按订单查询收付流水，按编号升序返回 `entries`，每条含 `seq`、`op_type`（accept/payment/refund/void/writeoff/correction/correction_cancel）、`biz_id`、`amount_cents` 与结果金额 `paid_result_cents`、`outstanding_result_cents`、`refunded_result_cents`、`written_off_result_cents`；订单不存在或跨租户返回 404。
 - `GET /health`：返回服务与数据库状态。
 
 ## 数据与配置
@@ -78,8 +80,14 @@ curl -s -X POST localhost:8000/orders/o1/writeoffs -H 'X-Tenant: t1' \
 # 作废：仅未收款订单可作废；biz_id 标识作废操作本身，重放返回同一记录
 curl -s -X POST localhost:8000/orders/o2/void -H 'X-Tenant: t1' \
   -H 'Content-Type: application/json' -d '{"biz_id":"void-0001"}'
+# 收款冲正修正：减少已收、增加未收；金额不得超过 已收 − 累计冲正 − 累计冲销
+curl -s -X POST localhost:8000/orders/o1/corrections -H 'X-Tenant: t1' \
+  -H 'Content-Type: application/json' -d '{"biz_id":"corr-0001","amount_cents":100}'
+# 取消冲正修正：取消金额取被取消修正的原始金额，无需也不可指定
+curl -s -X POST localhost:8000/orders/o1/correction-cancels -H 'X-Tenant: t1' \
+  -H 'Content-Type: application/json' -d '{"biz_id":"cancel-0001","correction_biz_id":"corr-0001"}'
 # 追溯流水
 curl -s localhost:8000/orders/o1/ledger -H 'X-Tenant: t1'
 ```
 
-金额口径（均为最小货币单位整数）：未收 = 订单金额 − 已收；累计冲正随冲正单调增加且不减少已收；累计冲销随冲销单调增加且不改已收与累计冲正；可退余额 = 已收 − 累计冲正，不受冲销影响。进入 `completed` 终态当且仅当已收大于零且 可退余额 − 累计冲销 归零；终态不可逆，此后收款、冲正、冲销、作废一律拒绝。结清（`settled`）不等于终态，结清后仍可在可退余额范围内冲正或冲销。作废与终态互斥：无收款订单只能作废（`voided`）、不进终态；进终态订单必已收款、不可作废。
+金额口径（均为最小货币单位整数）：未收 = 订单金额 − 已收；累计冲正随冲正单调增加且不减少已收；累计冲销随冲销单调增加且不改已收与累计冲正；可退余额 = 已收 − 累计冲正，不受冲销影响。冲正修正减少已收、增加未收，不改订单金额与累计冲正、累计冲销；取消冲正修正按原始金额恢复已收、减少未收；修正与取消后按既有口径重判状态，可退余额与冲销上限随已收同步变化。进入 `completed` 终态当且仅当已收大于零且 可退余额 − 累计冲销 归零；终态不可逆，此后收款、冲正、冲销、作废、修正与取消修正一律拒绝。结清（`settled`）不等于终态，结清后仍可在可退余额范围内冲正或冲销。作废与终态互斥：无收款订单只能作废（`voided`）、不进终态；进终态订单必已收款、不可作废。
